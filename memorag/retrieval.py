@@ -1,7 +1,7 @@
 import torch
 import faiss
 import numpy as np
-from typing import List, Mapping, Optional, Union
+from typing import List, Mapping, Optional, Union, Dict
 from collections import defaultdict
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from transformers.utils import logging
@@ -215,3 +215,10 @@ class DenseRetriever:
         scores, indices = self._index.search(embeddings, hits)
         return scores, indices
 
+
+class Retrieval:
+    def __init__(self, config: Dict):
+        self.config = config
+
+    def __call__(self, query: str, context: str, index=None, hits: int=10) -> List[str]:
+        pass
