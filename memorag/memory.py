@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from .memorag import Model
 from .retrieval import Retriever
 import os
@@ -13,9 +13,29 @@ from langchain_core.documents import Document
 from collections import defaultdict
 from sklearn.metrics.pairwise import cosine_similarity
 import json
+from functools import lru_cache
+import numpy as np
+from typing import Set
+import logging
+from time import time
+from contextlib import contextmanager
+import requests
+from cdlib import algorithms  
+import networkx.algorithms.community as nx_comm
+
+logger = logging.getLogger(__name__)
+
+@contextmanager
+def timer(name: str):
+    start = time()
+    yield
+    logger.info(f"{name} took {time() - start:.2f} seconds")
 
 class Memory:
-    def __init__(self, retriever, config: Dict, graph_file: str = "graph.graphml"):
+    def __init__(self, retriever: Retriever, config: Dict, graph_file: str = "graph.graphml"):
+        """
+        基础内存类，用于存储、加载和调用检索器与知识图谱等信息。
+        """
         self.retriever = retriever
         self.graph = nx.Graph()
         self.graph_file = graph_file
@@ -23,530 +43,837 @@ class Memory:
         self.nlp = spacy.load("zh_core_web_sm")
 
     def __call__(self, context: str) -> str:
+        """
+        占位方法，子类实现具体逻辑。
+        """
         pass
 
 class GraphMemory(Memory):
-    def __init__(self, retriever, config: Dict):
-        # 需要传入 graph_file 参数
-        super().__init__(retriever, config, graph_file="graph.graphml")
+    def __init__(self, retriever: Retriever, config: Dict):
+        """初始化 LazyGraphRAG 内存系统"""
+        default_config = {
+            'chunk_size': 500,
+            'chunk_overlap': 50,
+            'concept_min_len': 2,
+            'concept_max_len': 10,
+            'weight_threshold': 2,
+            'similarity_threshold': 0.6,
+            'max_neighbors': 3,
+            'max_communities': 3,
+            'graph_file': "graph.graphml",
+            'use_api': True,
+            'api_config': {
+                "model": "deepseek-chat",
+                "base_url": "https://api.deepseek.com",
+                "api_key": None
+            },
+            'nlp_model': "zh_core_web_sm"
+        }
+        
+        self.config = {**default_config, **config}
+        super().__init__(retriever, self.config, graph_file=self.config['graph_file'])
+        
         self.retriever = retriever
         self.retrieval_corpus = []
         
-        # 从配置的存储位置加载已有语料库
-        corpus_file = config.get('corpus_file')
-        if corpus_file and os.path.exists(corpus_file):
-            with open(corpus_file, 'r', encoding='utf-8') as f:
-                self.retrieval_corpus = json.load(f)
+        # 加载语料库
+        if 'corpus_file' in config and os.path.exists(config['corpus_file']):
+            try:
+                with open(config['corpus_file'], 'r', encoding='utf-8') as f:
+                    self.retrieval_corpus = json.load(f)
+                    if self.retrieval_corpus:
+                        self.retriever.add_documents(self.retrieval_corpus)
+            except Exception as e:
+                logger.error(f"Failed to load corpus: {str(e)}")
+                self.retrieval_corpus = []
         
-        # 添加镜像站点配置
-        mirror = "https://mirrors.aliyun.com/hugging-face"  
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "Qwen/Qwen2.5-3B", 
-            trust_remote_code=True,
-            mirror=mirror
-        )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen2.5-3B",
-            device_map="auto",
-            trust_remote_code=True,
-            mirror=mirror
-        ).eval()
-
-    def memorize(self, context: str) -> None:
-        # tools and deployed model: Spacy -> 
-        # API: aliyun API stc. deepseek API  -> ner / deepseek
-
-        # step 1: chunk the context into multiple chunks: semantic-splitting
-        # step 2: extract concepts and their co-occurrences, normalize the concepts
-        # step 3: uses graph statistics to optimize the concept graph and extract hierarchical community structure
-        # 北京市政府工作报告 -> 经济，民生，科技，教育，医疗，环保，文化，体育，社会治理，国际合作
-        # 刑法 -> 干啥会被判死刑？ 判了死刑还有救吗？
-        # how to construct and store the graph? -> ask chatgpt
-        """
-        Constructs, updates, saves, or loads a graph based on the input context.
-        """
-        # Load the graph if it exists
-        if os.path.exists(self.graph_file):
-            print(f"Loading existing graph from {self.graph_file}...")
-            self.graph = nx.read_graphml(self.graph_file)
+        # 初始化API客户端而不是本地模型
+        if self.config['use_api']:
+            self.api_url = f"{self.config['api_config']['base_url']}/v1/chat/completions"
+            self.headers = {
+                "Authorization": f"Bearer {self.config['api_config']['api_key']}",
+                "Content-Type": "application/json"
+            }
+            self.model = self.config['api_config']['model']
         else:
-            print(f"No existing graph found at {self.graph_file}, constructing a new graph...")
-            self.graph = nx.Graph()
+            # 保留原有的本地模型初始化代码作为备选
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.config['model_name'], 
+                    trust_remote_code=True,
+                    mirror=self.config['mirror']
+                )
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.config['model_name'],
+                    device_map="auto",
+                    trust_remote_code=True,
+                    mirror=self.config['mirror']
+                ).eval()
+            except Exception as e:
+                logger.error(f"Failed to initialize language model: {str(e)}")
+                raise
         
-        # Step 2: 使用SpaCy进行语义分块
-        doc = self.nlp(context)
-        sentences = [sent.text for sent in doc.sents]
-        sentence_vectors = [sent.vector for sent in doc.sents]
+        # 初始化NLP工具和向量化模型
+        try:
+            self.nlp = spacy.load(self.config['nlp_model'])
+            self.vectorizer = self.nlp
+        except:
+            self.nlp = spacy.load("zh_core_web_sm")
+            self.vectorizer = self.nlp
+            logger.warning("Failed to load advanced NLP model, fallback to basic model")
         
-        # 使用层次聚类将相似句子组合在一起
-        clustering = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=0.5,  # 可调整的相似度阈值
-            linkage='ward'
-        ).fit(sentence_vectors)
-        
-        # 控制块大小并组合文本
-        max_chunk_size = 1000  # 最大块字符数
-        chunks = []
-        current_chunk = []
-        current_size = 0
-        
-        for idx, label in enumerate(clustering.labels_):
-            sent_text = sentences[idx]
-            # 如果当前块太大，开始新块
-            if current_size + len(sent_text) > max_chunk_size:
-                if current_chunk:
-                    chunks.append("".join(current_chunk))
-                current_chunk = [sent_text]
-                current_size = len(sent_text)
-            else:
-                current_chunk.append(sent_text)
-                current_size += len(sent_text)
-                
-            # 如果是最后一个句子或下一个句子属于不同聚类
-            if (idx == len(sentences)-1 or 
-                clustering.labels_[idx] != clustering.labels_[idx+1]):
-                if current_chunk:
-                    chunks.append("".join(current_chunk))
-                current_chunk = []
-                current_size = 0
-        
-        # 为每个文本块创建Document对象
-        texts = [Document(page_content=chunk) for chunk in chunks]
+        # 缓存
+        self._concept_cache = {}  # 文本到概念的映射
+        self._vector_cache = {}   # 文本到向量的映射
+        self._community_cache = None  # 社区检测结果缓存
+        self._concept_to_community = {}  # 概念到社区的映射
 
-        # 将新的文本块添加到检索语料库
-        self.retrieval_corpus.extend([chunk.page_content for chunk in texts])
-        
-        # 更新检索器的索引 - 使用 add_documents 而不是 update_index
-        self.retriever.add_documents(self.retrieval_corpus)
-
-        # Step 3: 为每个块提取实体并建立关系
-        for text in texts:
-            doc = self.nlp(text.page_content)
-            entities = [ent.text for ent in doc.ents]
-            
-            # 构建实体关系
-            for i in range(len(entities)):
-                for j in range(i + 1, len(entities)):
-                    if not self.graph.has_edge(entities[i], entities[j]):
-                        self.graph.add_edge(entities[i], entities[j], weight=1)
-                    else:
-                        self.graph[entities[i]][entities[j]]['weight'] += 1
-        
-        # Step 4: Optimize the graph using graph statistics
-        weight_threshold = 2
-        edges_to_remove = [(u, v) for u, v, w in self.graph.edges(data="weight") if w < weight_threshold]
-        self.graph.remove_edges_from(edges_to_remove)
-
-        # Remove isolated nodes
-        isolated_nodes = list(nx.isolates(self.graph))
-        self.graph.remove_nodes_from(isolated_nodes)
-        # Step 5: Extract hierarchical community structure  
-        #top-k communities
-        top_level_communities = list(greedy_modularity_communities(self.graph))
-        community_dict = {i: list(community) for i, community in enumerate(top_level_communities)}
-        
-        # Extract sub-communities within each top-level community
-        hierarchical_structure = {}
-        for community_id, nodes in community_dict.items():
-            sub_graph = self.graph.subgraph(nodes)
-            sub_communities = list(greedy_modularity_communities(sub_graph))
-            hierarchical_structure[community_id] = [list(sc) for sc in sub_communities]
-
-        # Save the optimized graph to file
-        print(f"Saving optimized graph to {self.graph_file}...")
-        nx.write_graphml(self.graph, self.graph_file)
-        
-        #Convert the graph to a dictionary format   
-        graph_dict = {node: list(self.graph.neighbors(node)) for node in self.graph.nodes()}
-        return {"graph": graph_dict, "hierarchical_communities": hierarchical_structure}
-
-        '''
-        graph = {"entity 1": ["entity 2", "entity 3"], "entity 2": ["entity 4", "entity 5"]}
-        graph = []
-        return graph
-        '''
-    
-    def refine_query(self, query: str, context: str) -> List[str]:
-        # Step 1: 生成子查询
-        prompt = f"""请将以下问题分解成3到5个具体的子问题：
-        原始问题：{query}
-        
-        要求：
-        每个子问题必须是一个完整的问句
-        每个子问题必须以"？"结尾
-        
-        请直接列出子问题："""
-
-        max_attempts = 3  # 最多尝试3次
-        for attempt in range(max_attempts):
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            outputs = self.model.generate(
-                **inputs,
-                max_length=512,
-                temperature=0.7,
-                top_p=0.9,
-                repetition_penalty=1.1,
-                do_sample=True
+    def _call_api(self, prompt: str) -> str:
+        """调用 Deepseek API"""
+        try:
+            response = requests.post(
+                self.api_url,
+                headers=self.headers,
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                    "max_tokens": 2048
+                }
             )
+            response.raise_for_status()
+            return response.json()['choices'][0]['message']['content']
+        except Exception as e:
+            logger.error(f"API call failed: {str(e)}")
+            return ""
 
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            # 规范化子查询格式
-            sub_queries = []
-            for line in response.split('\n'):
-                line = line.strip()
-                if line and line[0].isdigit():
-                    # 提取问分并确保以问号结尾
-                    question = line.split('. ', 1)[1] if '. ' in line else line
-                    question = question.strip('*[] \t\n')  # 移除特殊字符
-                    if not question.endswith('？'):
-                        question += '？'
-                    sub_queries.append(question)
+    def memorize(self, context: str) -> Dict:
+        """优化的内存构建"""
+        try:
+            if not context.strip():
+                logger.warning("Empty context provided")
+                return {"graph": {}, "hierarchical_communities": {}}
             
-            # 只保留3-5个子查询
-            if 3 <= len(sub_queries) <= 5:
-                break
-            elif len(sub_queries) > 5:
-                sub_queries = sub_queries[:5]
-                break
-        
-        # 如果多次尝试后仍未得到足够的子查询，补充通用子查询
-        if len(sub_queries) < 3:
-            default_queries = [
-                f"{query}的具体实施情况如何？",
-                f"{query}取得了哪些主要成效？",
-                f"{query}面临哪些挑战和机遇？"
-            ]
-            sub_queries.extend(default_queries[:3 - len(sub_queries)])
-        
-        # Step 2: 利用知识图谱扩展子查询
-        optimized_queries = []
-        for sub_q in sub_queries:  
-            doc = self.nlp(sub_q)
-            entities = [ent.text for ent in doc.ents]
-            
-            related_entities = set()
-            for entity in entities:
-                if entity in self.graph:
-                    neighbors = list(self.graph.neighbors(entity))
-                    sorted_neighbors = sorted(
-                        neighbors,
-                        key=lambda x: self.graph[entity][x].get('weight', 0),
-                        reverse=True
-                    )[:3]
-                    related_entities.update(sorted_neighbors)
-            
-            if related_entities:
-                related_str = '、'.join(related_entities)
-                optimized_query = f"{sub_q}（相关领域：{related_str}）"
+            if os.path.exists(self.graph_file):
+                print(f"Loading existing graph from {self.graph_file}...")
+                self.graph = nx.read_graphml(self.graph_file)
             else:
-                optimized_query = sub_q
-                
-            optimized_queries.append(optimized_query)  
-
-        # 直接将子查询拼接作为合并查询，使用空格分隔
-        merged_query = " ".join(optimized_queries)
-        
-        return optimized_queries, merged_query
-
-    def match_query(self, query: str, sub_queries: List[str], 
-                    top_k: int = 5,           # 每个社区选择的top-k文本块
-                    zero_threshold: int = 3,   # z值：连续零相关社区的阈值
-                    relevance_budget: int = 30 # 总相关性测试预算
-                    ) -> List[str]:
-        """
-        为每个子查询检索和排序相关文本块。
-        
-        Args:
-            query: 主查询
-            sub_queries: 子查询列表 [3-5个]
-            top_k: 每个社区选择的top-k文本块数
-            zero_threshold: 触发子社区递归的连续零相关社区数
-            relevance_budget: 总的相关性测试预算
-        """
-        # 计算每个子查询的预算
-        budget_per_query = relevance_budget // len(sub_queries)
-        final_chunks = []
-        
-        for sub_q in sub_queries:
-            # 确保 sub_q 是字符串
-            if isinstance(sub_q, list):
-                sub_q = sub_q[0] if sub_q else ""
+                print(f"No existing graph found at {self.graph_file}, constructing a new graph...")
+                self.graph = nx.Graph()
             
-            # 1. 检索初始文本块
-            scores, indices = self.retriever.search(sub_q)
-            chunks = [self.retrieval_corpus[idx] for idx in indices[0]]
-            chunk_vectors = [self.nlp(chunk).vector for chunk in chunks]
+            # 使用文本分割器处理文本
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=500,
+                chunk_overlap=50,
+                separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?"]
+            )
+            chunks = text_splitter.split_text(context)
             
-            # 2. 构建初始社区
-            clustering = AgglomerativeClustering(
-                n_clusters=None,
-                distance_threshold=0.5,
-                linkage='ward'
-            ).fit(chunk_vectors)
+            # 更新检索语料库
+            new_docs = [chunk for chunk in chunks]
+            self.retrieval_corpus.extend(new_docs)
             
-            # 3. 构建社区和文本块的映射关系
-            communities = defaultdict(list)
-            chunk_to_community = {}
-            for idx, label in enumerate(clustering.labels_):
-                communities[label].append(chunks[idx])
-                chunk_to_community[chunks[idx]] = label
-                
-            # 4. 计算文本块与查询的相似度
-            chunk_scores = []
-            query_vec = self.nlp(sub_q).vector
+            # 使用add_documents添加新文档到检索器
+            if new_docs:
+                print(f"Adding {len(new_docs)} new documents to retriever...")
+                self.retriever.add_documents(new_docs)
+            
+            # 使用NLP抽取概念
+            concept_pairs = defaultdict(int)
+            
+            # 预处理：提取概念和构建图
             for chunk in chunks:
-                chunk_vec = self.nlp(chunk).vector
-                similarity = cosine_similarity([query_vec], [chunk_vec])[0][0]
-                chunk_scores.append((chunk, similarity))
+                # 获取概念并转换为列表以便索引
+                concepts = list(self._extract_concepts(chunk))
+                self._concept_cache[chunk] = set(concepts)
+                self._vector_cache[chunk] = self._get_text_vector(chunk)
+                
+                # 构建概念共现关系
+                for i in range(len(concepts)):
+                    for j in range(i + 1, len(concepts)):
+                        pair = tuple(sorted([concepts[i], concepts[j]]))
+                        concept_pairs[pair] += 1
             
-            # 5. 对文本块进行排序
-            chunk_scores.sort(key=lambda x: x[1], reverse=True)
+            # 构建和优化图
+            for (c1, c2), weight in concept_pairs.items():
+                if weight >= self.config['weight_threshold']:
+                    self.graph.add_edge(c1, c2, weight=weight)
             
-            # 6. 计算社区得分（基于top-k文本块）
-            community_scores = defaultdict(float)
-            for chunk, score in chunk_scores[:top_k]:
-                comm_id = chunk_to_community[chunk]
-                community_scores[comm_id] += score
-                
-            # 7. 对社区进行排序
-            ranked_communities = sorted(
-                communities.items(),
-                key=lambda x: community_scores[x[0]],
-                reverse=True
-            )
+            # 一次性社区检测
+            self._community_cache = algorithms.leiden(self.graph)
             
-            # 8. 迭代处理社区
-            tested_chunks = set()
-            relevant_chunks = []
-            zero_count = 0
-            current_budget = budget_per_query
+            # 构建概念到社区的映射
+            for comm_id, community in enumerate(self._community_cache.communities):
+                for concept in community:
+                    self._concept_to_community[concept] = comm_id
             
-            def process_community(comm_chunks, depth=0):
-                nonlocal zero_count, current_budget
+            # 移除孤立节点
+            isolated_nodes = list(nx.isolates(self.graph))
+            self.graph.remove_nodes_from(isolated_nodes)
+
+            # 使用贪婪模块度算法进行社区检测
+            communities = list(greedy_modularity_communities(self.graph))
+            
+            # 构建层次社区结构
+            hierarchical_structure = {}
+            for i, community in enumerate(communities):
+                sub_graph = self.graph.subgraph(community)
+                sub_communities = list(greedy_modularity_communities(sub_graph))
+                hierarchical_structure[i] = [list(sc) for sc in sub_communities]
+
+            # 保存图结构
+            print(f"Saving optimized graph to {self.graph_file}...")
+            nx.write_graphml(self.graph, self.graph_file)
+
+            return {
+                "graph": {node: list(self.graph.neighbors(node)) for node in self.graph.nodes()},
+                "hierarchical_communities": hierarchical_structure
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in memorize: {str(e)}")
+            raise
+
+    def refine_query(self, query: str, context: str) -> tuple[List[str], str]:
+        """
+        LazyGraphRAG风格的查询优化：
+        1. 使用NLP抽取查询中的关键概念
+        2. 利用图结构找到相关概念组
+        3. 使用LLM生成自然的子查询
+        """
+        # 提取查询概念和扩展概念
+        query_concepts = self._extract_concepts(query)
+        expanded_concepts = set()
+        for concept in query_concepts:
+            if concept in self.graph:
+                neighbors = set(self.graph.neighbors(concept))
+                for neighbor in list(neighbors):
+                    if self.graph[concept][neighbor]['weight'] >= self.config['weight_threshold']:
+                        expanded_concepts.add(neighbor)
+        
+        # 按重要性排序概念
+        concept_scores = []
+        for concept in (query_concepts | expanded_concepts):
+            if concept in self.graph:
+                score = (
+                    self.graph.degree(concept) * 2 if concept in query_concepts else self.graph.degree(concept),
+                    sum(self.graph[concept][n]['weight'] for n in self.graph[concept])
+                )
+                concept_scores.append((concept, score))
+        
+        # 选择最重要的概念对
+        concept_scores.sort(key=lambda x: x[1], reverse=True)
+        top_concepts = [c for c, _ in concept_scores[:6]]  # 取前6个概念
+        
+        # 使用LLM生成子查询
+        concept_pairs = []
+        for i in range(0, len(top_concepts), 2):
+            if i + 1 < len(top_concepts):
+                concept_pairs.append((top_concepts[i], top_concepts[i+1]))
+        
+        prompt = f"""基于原始问题和给定的概念对生成3-4个自然的子问题。
+
+原始问题：{query}
+
+概念对：
+{' '.join([f'({c1}, {c2})' for c1, c2 in concept_pairs])}
+
+要求：
+子问题要自然流畅
+保持与原问题的关联
+每个子问题关注不同方面
+"""
+
+        try:
+            # 使用LLM生成子查询
+            if self.config['use_api']:
+                sub_queries_text = self._call_api(prompt)
+            else:
+                inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+                outputs = self.model.generate(**inputs, max_length=256, temperature=0.7)
+                sub_queries_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # 解析子查询，去掉数字前缀
+            sub_queries = []
+            for line in sub_queries_text.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                # 去掉数字前缀和点
+                line = line.lstrip('0123456789. ')
+                if line and not line.startswith('示例'):
+                    sub_queries.append(line)
+            
+            # 添加原始查询
+            sub_queries.append(query)
+            
+            # 合并查询
+            merged_query = " ".join(sub_queries)
+            return sub_queries, merged_query
+            
+        except Exception as e:
+            logger.error(f"Failed to generate sub-queries: {str(e)}")
+            # 后备方案：使用简单的模板
+            sub_queries = [query]  # 至少保留原始查询
+            for c1, c2 in concept_pairs[:2]:
+                sub_queries.append(f"{query}中{c1}与{c2}的联系？")
+            return sub_queries, " ".join(sub_queries)
+
+    def match_query(self, query: str, sub_queries: List[str],
+                    top_k: int = 5,
+                    similarity_threshold: float = 0.4) -> List[str]:
+        """优化的查询匹配"""
+        with timer("match_query"):
+            final_chunks = []
+            seen_chunks = set()
+            
+            for sub_q in sub_queries:
+                if not isinstance(sub_q, str):
+                    continue
                 
-                if current_budget <= 0:
-                    return []
-                    
-                # 对社区内文本块进行相关性评估
-                relevant = []
-                for chunk in comm_chunks:
-                    if chunk in tested_chunks:
-                        continue
-                        
-                    if current_budget <= 0:
-                        break
-                        
-                    # 使用LLM评估相关性
-                    prompt = f"""请评估以下文本与问题的相关性，返回0-1之间的分数。
-                    问题：{sub_q}
-                    文本：{chunk}
-                    只返回分数，不要其他内容。"""
-                    
-                    response = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-                    outputs = self.model.generate(
-                        **response,
-                        max_length=128,
-                        temperature=0.0
-                    )
-                    # 解析生成的文本，提取分数
-                    generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                    try:
-                        relevance = float(generated_text.strip().split()[-1])  # 提取最后一个数字作为分数
-                    except ValueError:
-                        print(f"无法解析生成的文本为浮点数: {generated_text}")
-                        continue
-                    
-                    tested_chunks.add(chunk)
-                    current_budget -= 1
-                    
-                    if relevance >= 0.6:  # 相关性阈值
-                        relevant.append(chunk)
-                        zero_count = 0
-                    else:
-                        zero_count += 1
-                        
-                return relevant
+                # 1. 初始检索
+                chunk_scores = self._initial_retrieval(sub_q, top_k * 3)
                 
-            # 9. 处理主社区
-            for comm_id, comm_chunks in ranked_communities:
-                # 处理当前社区
-                new_relevant = process_community(comm_chunks)
-                relevant_chunks.extend(new_relevant)
+                # 2. 快速相似度评估
+                candidates = self._fast_filter_candidates(sub_q, chunk_scores)
                 
-                # 如果连续z个社区没有相关内容，进入子社区
-                if zero_count >= zero_threshold:
-                    # 构建子社区
-                    sub_vectors = [self.nlp(chunk).vector for chunk in comm_chunks]
-                    if len(sub_vectors) > 1:  # 确保有足够的样本进行聚类
-                        sub_clustering = AgglomerativeClustering(
-                            n_clusters=min(len(comm_chunks) // 2, 3),
-                            linkage='ward'
-                        ).fit(sub_vectors)
-                        
-                        # 处理子社区
-                        sub_communities = defaultdict(list)
-                        for idx, label in enumerate(sub_clustering.labels_):
-                            sub_communities[label].append(comm_chunks[idx])
-                        
-                        for sub_comm_chunks in sub_communities.values():
-                            new_relevant = process_community(sub_comm_chunks, depth=1)
-                            relevant_chunks.extend(new_relevant)
-                            
-                            if current_budget <= 0:
-                                break
+                # 3. 社区增强
+                enhanced_candidates = self._enhance_with_communities(sub_q, candidates)
                 
-                    zero_count = 0  # 重置计数器
-                    
-                if current_budget <= 0:
+                # 4. LLM评估（仅对最有希望的候选进行）
+                for chunk, score in enhanced_candidates[:top_k]:
+                    if chunk not in seen_chunks and score >= similarity_threshold:
+                        if self._llm_evaluate_relevance(sub_q, chunk):
+                            final_chunks.append(chunk)
+                            seen_chunks.add(chunk)
+            
+            return final_chunks[:top_k]
+
+    def _fast_filter_candidates(self, query: str, chunk_scores: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+        """快速过滤候选文档"""
+        # 获取查询概念（使用缓存）
+        if query not in self._concept_cache:
+            self._concept_cache[query] = self._extract_concepts(query)
+        query_concepts = self._concept_cache[query]
+        
+        # 获取查询向量（使用缓存）
+        if query not in self._vector_cache:
+            self._vector_cache[query] = self._get_text_vector(query)
+        query_vector = self._vector_cache[query]
+        
+        # 计算概念重叠度和向量相似度
+        filtered_scores = []
+        for chunk, initial_score in chunk_scores:
+            # 使用缓存的概念
+            chunk_concepts = self._concept_cache.get(chunk)
+            if chunk_concepts is None:
+                chunk_concepts = self._extract_concepts(chunk)
+                self._concept_cache[chunk] = chunk_concepts
+            
+            # 计算概念重叠
+            overlap = len(query_concepts & chunk_concepts)
+            
+            # 使用缓存的向量
+            if chunk not in self._vector_cache:
+                self._vector_cache[chunk] = self._get_text_vector(chunk)
+            chunk_vector = self._vector_cache[chunk]
+            
+            # 计算向量相似度
+            vector_sim = float(cosine_similarity(
+                [query_vector],
+                [chunk_vector]
+            )[0][0])
+            
+            # 综合评分
+            score = (initial_score * 0.4 + 
+                    (overlap / max(len(query_concepts), 1)) * 0.3 + 
+                    vector_sim * 0.3)
+            
+            filtered_scores.append((chunk, score))
+        
+        return sorted(filtered_scores, key=lambda x: x[1], reverse=True)
+
+    def _enhance_with_communities(self, 
+                            query: str, 
+                            candidates: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+        """使用社区信息增强候选文档"""
+        query_concepts = self._concept_cache[query]
+        query_communities = {
+            self._concept_to_community[c]
+            for c in query_concepts
+            if c in self._concept_to_community
+        }
+        
+        enhanced_scores = []
+        for chunk, score in candidates:
+            chunk_concepts = self._concept_cache[chunk]
+            chunk_communities = {
+                self._concept_to_community[c]
+                for c in chunk_concepts
+                if c in self._concept_to_community
+            }
+            
+            # 计算社区重叠
+            community_overlap = len(query_communities & chunk_communities)
+            enhanced_score = score * (1 + 0.2 * community_overlap)
+            enhanced_scores.append((chunk, enhanced_score))
+        
+        return sorted(enhanced_scores, key=lambda x: x[1], reverse=True)
+
+    def _llm_evaluate_relevance(self, query: str, chunk: str, cache_key: str = None) -> bool:
+        """LLM相关性评估（带缓存）"""
+        cache_key = f"{query}::{chunk}" if cache_key is None else cache_key
+        
+        if hasattr(self, '_llm_cache') and cache_key in self._llm_cache:
+            return self._llm_cache[cache_key]
+        
+        relevance = self._assess_chunk_relevance(query, chunk)
+        
+        if not hasattr(self, '_llm_cache'):
+            self._llm_cache = {}
+        self._llm_cache[cache_key] = relevance >= 0.6
+        
+        return self._llm_cache[cache_key]
+
+    def _initial_retrieval(self, query: str, top_k: int) -> List[Tuple[str, float]]:
+        """初始检索和评分"""
+        scores, indices = self.retriever.search(query, top_k=top_k)
+        if isinstance(indices, torch.Tensor):
+            indices = indices.tolist()
+        
+        chunk_scores = []
+        for idx, score in zip(indices[0], scores[0]):
+            if idx < len(self.retrieval_corpus):
+                chunk = self.retrieval_corpus[idx]
+                chunk_scores.append((chunk, float(score)))
+        
+        return chunk_scores
+
+    def _build_doc_community_graph(self, chunk_scores: List[Tuple[str, float]]) -> nx.Graph:
+        """构建文档-社区二分图"""
+        graph = nx.Graph()
+        
+        # 使用整数作为节点ID
+        doc_nodes = {}  # 文档节点映射
+        comm_nodes = {}  # 社区节点映射
+        next_id = 0
+        
+        # 添加文档节点
+        for chunk, score in chunk_scores:
+            doc_id = next_id
+            next_id += 1
+            doc_nodes[doc_id] = chunk
+            graph.add_node(doc_id, type='document', score=score)
+            
+            # 提取文档中的概念
+            concepts = self._extract_concepts(chunk)
+            
+            # 找到概念所属的社区
+            for concept in concepts:
+                if concept in self.graph:
+                    communities = nx_comm.label_propagation_communities(self.graph)
+                    for comm_id, community in enumerate(communities):
+                        if concept in community:
+                            if comm_id not in comm_nodes:
+                                comm_nodes[comm_id] = f"community_{comm_id}"
+                                graph.add_node(next_id + comm_id, type='community')
+                            graph.add_edge(doc_id, next_id + comm_id, weight=score)
+        
+        # 添加节点属性
+        nx.set_node_attributes(graph, {k: {'name': v} for k, v in {**doc_nodes, **comm_nodes}.items()})
+        
+        return graph
+
+    def _rank_communities(self, communities, chunk_scores: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+        """对社区进行排序"""
+        community_scores = defaultdict(float)
+        
+        # 使用 communities.communities 获取社区列表
+        for chunk, score in chunk_scores:
+            for comm in communities.communities:
+                # 获取社区中的实际文档内容
+                try:
+                    # 使用doc_community_graph而不是self.graph
+                    community_docs = [
+                        communities.graph.nodes[n].get('name', str(n)) 
+                        for n in comm
+                    ]
+                    if chunk in community_docs:
+                        community_scores[tuple(comm)] += score
+                except KeyError:
+                    continue
+        
+        return sorted(community_scores.items(), key=lambda x: x[1], reverse=True)
+
+    def _iterative_deepening_search(self, query: str, ranked_communities: List[Tuple[str, float]], 
+                                  community_budget: int, relevance_budget: int) -> List[str]:
+        """迭代深入搜索相关文档"""
+        relevant_chunks = []
+        tested_chunks = set()
+        zero_relevance_count = 0
+        
+        for comm_nodes, _ in ranked_communities:
+            if zero_relevance_count >= community_budget:
+                break
+            
+            # 获取社区中的实际文档内容
+            try:
+                community_docs = [
+                    self.graph.nodes[n].get('name', str(n))
+                    for n in comm_nodes
+                    if self.graph.nodes[n].get('type') == 'document'
+                ]
+            except KeyError:
+                continue
+            
+            # 获取未测试的文档
+            untested_chunks = [
+                doc for doc in community_docs 
+                if doc not in tested_chunks
+            ][:relevance_budget]
+            
+            # 评估相关性
+            found_relevant = False
+            for chunk in untested_chunks:
+                if len(relevant_chunks) >= relevance_budget:
                     break
                     
-            final_chunks.extend(relevant_chunks)
+                relevance = self._assess_chunk_relevance(query, chunk)
+                tested_chunks.add(chunk)
+                
+                if relevance >= 0.6:  # 相关性阈值
+                    relevant_chunks.append(chunk)
+                    found_relevant = True
+            
+            if not found_relevant:
+                zero_relevance_count += 1
+            else:
+                zero_relevance_count = 0
         
-        return final_chunks
+        return relevant_chunks
 
-    def map_answer(self, query: str, answer: str, max_length: int=1024) -> str:
-        """
-        从相关文本块中提取并组织与查询相关的声明。
+    def _assess_chunk_relevance(self, query: str, chunk: str) -> float:
+        """使用LLM评估文档相关性"""
+        prompt = f"""评估以下文本与问题的相关性（返回0-1分）：
+问题：{query}
+文本：{chunk}
+仅返回分数，无需解释。"""
+
+        try:
+            if self.config['use_api']:
+                score_text = self._call_api(prompt)
+            else:
+                inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+                outputs = self.model.generate(**inputs, max_length=128, temperature=0.0)
+                score_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            return float(score_text.strip())
+        except:
+            return 0.0
+
+    def _compute_overlap(self, text1: str, text2: str) -> float:
+        """计算两段文本的内容重叠度"""
+        concepts1 = self._extract_concepts(text1)
+        concepts2 = self._extract_concepts(text2)
         
-        Args:
-            query: 主查询
-            answer: 包含相关文本块的列表
-            max_length: 最大上下文窗口大小
+        if not concepts1 or not concepts2:
+            return 0.0
         
-        Returns:
-            str: 组织好的声明列表
-        """
-        # 将文本块列表转换为单独的文本块
-        chunks = answer.split('\n') if isinstance(answer, str) else answer
+        overlap = len(concepts1 & concepts2)
+        return overlap / min(len(concepts1), len(concepts2))
+
+    def _evaluate_chunks_with_llm(self, query: str, chunks: List[str], budget: int) -> List[str]:
+        """使用LLM评估文本块相关性的辅助方法"""
+        relevant_chunks = []
         
-        # 为每个文本块提取概念并构建子图
-        concept_graph = nx.Graph()
-        chunk_concepts = {}  # 存储每个文本块的概念
+        for chunk in chunks[:budget]:
+            prompt = f"评估文本与问题的相关性（返回0-1分）：\n问题：{query}\n文本：{chunk}"
+            
+            if self.config['use_api']:
+                score_text = self._call_api(prompt)
+            else:
+                # 原有的本地模型调用代码
+                inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=128,
+                    temperature=0.0
+                )
+                score_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            try:
+                score = float(score_text.strip())
+                if score >= 0.6:
+                    relevant_chunks.append(chunk)
+            except ValueError:
+                continue
+            
+        return relevant_chunks
+
+    def map_answer(self, query: str, chunks: List[str], max_length: int = 1024) -> str:
+        """改进的答案映射方法"""
+        if not chunks:
+            return ""
+        
+        # 1. 构建概念子图
+        concept_graph = self._build_concept_subgraph(chunks)
+        
+        # 2. 使用 Leiden 算法检测概念社区
+        communities = algorithms.leiden(concept_graph)
+        
+        # 3. 根据社区对文档分组
+        chunk_groups = self._group_chunks_by_communities(chunks, communities)
+        
+        # 4. 从每个组中提取相关声明
+        all_claims = []
+        for group in chunk_groups:
+            claims = self._extract_claims_from_group(query, group)
+            all_claims.extend(claims)
+        
+        # 5. 排序和筛选声明
+        ranked_claims = self._rank_claims(query, all_claims)
+        selected_claims = self._filter_claims(ranked_claims, max_length)
+        
+        return "\n".join(selected_claims)
+
+    def _build_concept_subgraph(self, chunks: List[str]) -> nx.Graph:
+        """构建概念子图"""
+        graph = nx.Graph()
+        node_map = {}  # 用于存储概念到节点ID的映射
+        next_id = 0
+        
+        # 提取所有概念
+        for chunk in chunks:
+            concepts = self._extract_concepts(chunk)
+            
+            # 添加节点和边
+            for c1 in concepts:
+                if c1 not in node_map:
+                    node_map[c1] = str(next_id)
+                    next_id += 1
+                for c2 in concepts:
+                    if c1 != c2:
+                        if c2 not in node_map:
+                            node_map[c2] = str(next_id)
+                            next_id += 1
+                        if not graph.has_edge(node_map[c1], node_map[c2]):
+                            graph.add_edge(node_map[c1], node_map[c2], weight=1)
+                        else:
+                            graph[node_map[c1]][node_map[c2]]['weight'] += 1
+        
+        # 添加节点属性
+        nx.set_node_attributes(graph, {v: {'name': k} for k, v in node_map.items()})
+        
+        return graph
+
+    def _group_chunks_by_communities(self, chunks: List[str], communities) -> List[List[str]]:
+        """根据概念社区对文档分组"""
+        chunk_groups = defaultdict(list)
         
         for chunk in chunks:
-            doc = self.nlp(chunk)
-            # 提取实体作为概念
-            concepts = [ent.text for ent in doc.ents]
-            chunk_concepts[chunk] = concepts
-            
-            # 在概念之间建立边
-            for i in range(len(concepts)):
-                for j in range(i + 1, len(concepts)):
-                    if not concept_graph.has_edge(concepts[i], concepts[j]):
-                        concept_graph.add_edge(concepts[i], concepts[j], weight=1)
-                    else:
-                        concept_graph[concepts[i]][concepts[j]]['weight'] += 1
-        
-        # 使用社区检测对概念进行分组
-        communities = list(greedy_modularity_communities(concept_graph))
-        
-        # 基于概念社区对文本块进行分组
-        chunk_groups = defaultdict(list)
-        for chunk, concepts in chunk_concepts.items():
-            # 找出该文本块概念所属的主要社区
+            concepts = self._extract_concepts(chunk)
+            # 找到文档主要属于哪个社区
             community_counts = defaultdict(int)
-            for concept in concepts:
-                for i, community in enumerate(communities):
-                    if concept in community:
-                        community_counts[i] += 1
             
-            # 将文本块分配给包含其最多概念的社区
+            # 使用 communities.communities 访问社区列表
+            for comm_id, community in enumerate(communities.communities):
+                overlap = len(concepts & set(community))
+                if overlap > 0:
+                    community_counts[comm_id] += overlap
+            
             if community_counts:
                 main_community = max(community_counts.items(), key=lambda x: x[1])[0]
                 chunk_groups[main_community].append(chunk)
         
-        # 使用LLM从每个组中提取相关声明
-        all_claims = []
-        for group in chunk_groups.values():
-            # 将组内文本块合并
-            group_text = "\n".join(group)
+        return list(chunk_groups.values())
+
+    def _extract_claims_from_group(self, query: str, chunks: List[str]) -> List[str]:
+        """从文档组中提取相关声明"""
+        combined_text = "\n".join(chunks)
+        prompt = f"""从以下文本中提取与问题相关的关键声明：
+
+问题：{query}
+
+文本：
+{combined_text}
+
+请提取3-5个最相关的声明，每个声明一行。"""
+
+        try:
+            if self.config['use_api']:
+                response = self._call_api(prompt)
+            else:
+                inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+                outputs = self.model.generate(**inputs, max_length=512, temperature=0.7)
+                response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # 构建提取声明的提示
-            prompt = f"""从以下文本中提取与问题相关的关键声明：
-            问题：{query}
-            文本：{group_text}
-            
-            请提取3-5个关键声明，每个声明应该：
-            直接回答问题的某个方面
-            具体且有信息量
-            避免重复信息
-            
-            仅返回声明列表，每行一个声明。"""
-            
-            # 使用LLM生成声明
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            outputs = self.model.generate(
-                **inputs,
-                max_length=512,
-                temperature=0.7,
-                top_p=0.9,
-                repetition_penalty=1.1
-            )
-            
-            claims = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            all_claims.extend([c.strip() for c in claims.split('\n') if c.strip()])
+            return [claim.strip() for claim in response.split('\n') if claim.strip()]
+        except:
+            return []
+
+    def _rank_claims(self, query: str, claims: List[str]) -> List[str]:
+        """对声明进行排序"""
+        claim_scores = []
+        query_concepts = self._extract_concepts(query)
         
-        # 对声明进行排序和筛选
-        def score_claim(claim):
-            # 计算声明的相关性分数
-            prompt = f"""评估以下声明与问题的相关性（0-1分）：
-            问题：{query}
-            声明：{claim}
-            仅返回分数。"""
+        for claim in claims:
+            # 计算概念重叠
+            claim_concepts = self._extract_concepts(claim)
+            overlap = len(query_concepts & claim_concepts)
             
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            outputs = self.model.generate(
-                **inputs,
-                max_length=128,
-                temperature=0.0
-            )
-            score_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            try:
-                return float(score_text.strip())
-            except:
-                return 0.0
+            # 计算向量相似度
+            similarity = cosine_similarity(
+                [self._get_text_vector(query)],
+                [self._get_text_vector(claim)]
+            )[0][0]
+            
+            # 综合评分
+            score = (overlap * 0.4 + similarity * 0.6)
+            claim_scores.append((claim, score))
         
-        # 对声明进行评分和排序
-        scored_claims = [(claim, score_claim(claim)) for claim in all_claims]
-        scored_claims.sort(key=lambda x: x[1], reverse=True)
-        
-        # 选择最相关的声明，确保总长度不超过max_length
-        selected_claims = []
+        return [claim for claim, _ in sorted(claim_scores, key=lambda x: x[1], reverse=True)]
+
+    def _filter_claims(self, claims: List[str], max_length: int) -> List[str]:
+        """筛选声明以适应上下文窗口"""
+        selected = []
         current_length = 0
         
-        for claim, _ in scored_claims:
-            if current_length + len(claim) + 1 <= max_length:  # +1 为换行符
-                selected_claims.append(claim)
+        for claim in claims:
+            if current_length + len(claim) + 1 <= max_length:
+                selected.append(claim)
                 current_length += len(claim) + 1
             else:
                 break
         
-        # 返回筛选后的声明列表
-        return "\n".join(selected_claims)
+        return selected
 
     def reduce_answer(self, query: str, answer: str) -> str:
-        # open-sourced: qwen 2.5 3B, llama3.2 3B 
-        # API: gpt3.5 API stc. deepseek API 
+        """通用的答案生成提示"""
+        prompt = f"""基于以下信息回答问题：
 
-        # produce the final answer from the useful claims
-        pass
+问题：{query}
+
+相关信息：
+{answer}
+
+要求：
+1. 直接回答问题
+2. 保持客观准确
+3. 有数据的要保留数据
+4. 有逻辑地组织信息
+5. 如果信息不足，说明缺少哪些信息
+
+请直接给出回答。"""
+
+        if not answer:
+            return ""
+        
+        try:
+            # 使用 Deepseek API 生成答案
+            final_answer = self._call_api(prompt)
+            
+            # 清理和格式化答案
+            final_answer = final_answer.strip()
+            if not final_answer:
+                return "抱歉，无法生成有效的回答。"
+                
+            return final_answer
+            
+        except Exception as e:
+            logger.error(f"Error in reduce_answer: {str(e)}")
+            return "生成答案时发生错误，请稍后重试。"
 
     def __call__(self, query: str, context: str) -> str:
+        
         answer = ""
         return answer
 
+    @lru_cache(maxsize=1000)
+    def _get_concept_vector(self, text: str) -> np.ndarray:
+        """缓存概念的向量表示"""
+        return self.nlp(text).vector
+
+    @lru_cache(maxsize=1000)
+    def _extract_concepts(self, text: str) -> Set[str]:
+        """通用的概念提取"""
+        concepts = set()
+        doc = self.nlp(text)
+        
+        # 提取命名实体
+        for ent in doc.ents:
+            if 2 <= len(ent.text) <= 10:
+                concepts.add(ent.text)
+        
+        # 提取核心名词短语
+        for token in doc:
+            # 提取名词
+            if token.pos_ in ['NOUN', 'PROPN'] and 2 <= len(token.text) <= 10:
+                concepts.add(token.text)
+            # 提取重要的依存关系
+            if token.dep_ in ['nsubj', 'dobj', 'pobj'] and 2 <= len(token.text) <= 10:
+                concepts.add(token.text)
+        
+        return concepts
+
+    def _save_graph(self):
+        """优化的图存储"""
+        try:
+            # 保存为二进制格式以提高效率
+            nx.write_gpickle(self.graph, self.graph_file + '.pickle')
+            # 同时保存可读格式用于测试
+            nx.write_graphml(self.graph, self.graph_file)
+        except Exception as e:
+            logger.error(f"Failed to save graph: {str(e)}")
+
+    def _load_graph(self):
+        """优化的图加载"""
+        try:
+            # 优先尝试加载二进制格式
+            if os.path.exists(self.graph_file + '.pickle'):
+                return nx.read_gpickle(self.graph_file + '.pickle')
+            elif os.path.exists(self.graph_file):
+                return nx.read_graphml(self.graph_file)
+            return nx.Graph()
+        except Exception as e:
+            logger.error(f"Failed to load graph: {str(e)}")
+            return nx.Graph()
+
+    @lru_cache(maxsize=1000)
+    def _get_word_vector(self, word: str) -> np.ndarray:
+        """获取词向量"""
+        doc = self.nlp(word)
+        return doc.vector
+
+    @lru_cache(maxsize=1000)
+    def _get_text_vector(self, text: str) -> np.ndarray:
+        """统一的文本向量化接口"""
+        try:
+            doc = self.vectorizer(text)
+            return doc.vector
+        except Exception as e:
+            logger.error(f"Failed to get vector for text: {str(e)}")
+            return np.zeros(768)  # 返回零向量作为后备
+
+    def _get_batch_vectors(self, texts: List[str]) -> np.ndarray:
+        """批量获取文本向量"""
+        try:
+            docs = list(self.vectorizer.pipe(texts))
+            return np.array([doc.vector for doc in docs])
+        except Exception as e:
+            logger.error(f"Failed to get batch vectors: {str(e)}")
+            return np.zeros((len(texts), 768))
 
 class AgentMemory(Memory):
     def __init__(self, config: Dict):
-        super().__init__(config)
+        super().__init__(None, config)
 
 
 class KVMemory(Memory):
     def __init__(self, config: Dict):
-        super().__init__(config)
+        super().__init__(None, config)
 
     def memorize(self, context: str) -> None:
+        # KVMemory的记忆机制留给未来扩展，当前占位
         pass
 
 
@@ -555,5 +882,3 @@ if __name__ == "__main__":
     context = "MemoRAG是一种基于记忆的检索增强生成模型，它通过记忆来增强生成模型的生成能力。"
     memory = KVMemory({})
     memory.memorize(context)
-    
-    
